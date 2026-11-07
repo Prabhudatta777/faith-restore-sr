@@ -1,0 +1,222 @@
+"""
+utils.py - Shared helper functions for Faith Restore SR.
+
+Used by ALL 4 methods:
+1. Bicubic
+2. Edge + Segmentation
+3. Dictionary / Patch-based
+4. CNN (SRCNN)
+
+Functions:
+- set_seed()        : reproducibility
+- calculate_psnr()  : PSNR ↑ higher is better
+- calculate_ssim()  : SSIM ↑ higher is better
+- save_sr_image()   : save LR / SR / HR side-by-side for report
+- evaluate_method() : run any method on test set and get avg metrics
+"""
+
+import random
+import numpy as np
+import 【entity-torch¦canonical_name=torch】
+from pathlib import Path
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# scikit-image for SSIM
+from skimage.metrics import structural_similarity as sk_ssim
+
+# --------------------------------------------------
+# 1. Reproducibility
+# --------------------------------------------------
+def set_seed(seed: int = 42):
+    """Set seed for python, numpy, 【entity-torch¦canonical_name=torch】 - same result every run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    【entity-torch¦canonical_name=torch】.manual_seed(seed)
+    if 【entity-torch¦canonical_name=torch】.cuda.is_available():
+        【entity-torch¦canonical_name=torch】.cuda.manual_seed_all(seed)
+    print(f"Seed set to {seed}")
+
+# --------------------------------------------------
+# 2. Metrics - PSNR, SSIM
+# --------------------------------------------------
+def calculate_psnr(hr: np.ndarray, sr: np.ndarray, max_val: float = 255.0) -> float:
+    """
+    PSNR - Peak Signal-to-Noise Ratio.
+    hr, sr: numpy arrays, shape (H, W, 3) or (H, W), values 0-255
+    Returns: PSNR in dB, higher = better
+    """
+    hr = hr.astype(np.float64)
+    sr = sr.astype(np.float64)
+
+    mse = np.mean((hr - sr) ** 2)
+    if mse == 0:
+        return float("inf")  # perfect reconstruction
+
+    psnr = 20 * np.log10(max_val / np.sqrt(mse))
+    return float(psnr)
+
+def calculate_ssim(hr: np.ndarray, sr: np.ndarray) -> float:
+    """
+    SSIM - Structural Similarity.
+    hr, sr: numpy arrays, shape (H, W, 3), values 0-255
+    Returns: SSIM 0 to 1, higher = better (1 = identical)
+    """
+    hr = hr.astype(np.uint8)
+    sr = sr.astype(np.uint8)
+
+    # channel_axis=-1 for RGB images (skimage >= 0.19)
+    # For older skimage, use multichannel=True
+    try:
+        score = sk_ssim(hr, sr, channel_axis=-1, data_range=255)
+    except TypeError:
+        score = sk_ssim(hr, sr, multichannel=True, data_range=255)
+
+    return float(score)
+
+def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """
+    Convert torch tensor (C, H, W) in range 0-1
+    to numpy (H, W, C) in range 0-255, uint8.
+    """
+    img = tensor.detach().cpu().clamp(0, 1).numpy()
+    img = np.transpose(img, (1, 2, 0))  # C,H,W -> H,W,C
+    img = (img * 255.0).round().astype(np.uint8)
+    return img
+
+def numpy_to_tensor(img_np: np.ndarray) -> torch.Tensor:
+    """
+    Convert numpy (H, W, C) 0-255 to torch (C, H, W) 0-1.
+    """
+    img = img_np.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))  # H,W,C -> C,H,W
+    return torch.from_numpy(img)
+
+# --------------------------------------------------
+# 3. Save images for report / GitHub
+# --------------------------------------------------
+def save_comparison(lr: np.ndarray, sr: np.ndarray, hr: np.ndarray,
+                    save_path: str | Path, title: str = ""):
+    """
+    Save LR | SR | HR side-by-side image.
+    Use this for your report figures.
+
+    lr, sr, hr: numpy (H, W, 3), 0-255
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(lr)
+    axes[0].set_title(f"LR Input\n(Blurred + Downsampled)")
+    axes[0].axis("off")
+
+    axes[1].imshow(sr)
+    axes[1].set_title(f"SR Output\n{title}")
+    axes[1].axis("off")
+
+    axes[2].imshow(hr)
+    axes[2].set_title("HR Ground Truth")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {save_path}")
+
+def save_single_image(img_np: np.ndarray, save_path: str | Path):
+    """Save a single numpy image (H, W, 3) 0-255."""
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(img_np.astype(np.uint8)).save(save_path)
+
+# --------------------------------------------------
+# 4. Evaluate any method on full test set
+# --------------------------------------------------
+def evaluate_method(sr_function, dataloader, save_dir: str | Path = None,
+                    max_save: int = 3):
+    """
+    Evaluate ANY method fairly on the same test set.
+
+    sr_function: a function that takes LR tensor (1, C, H, W)
+                 and returns SR tensor (1, C, H*4, W*4)
+                 Example: bicubic_fn, srcnn_model, etc.
+
+    Returns: dict with avg PSNR, avg SSIM
+
+    This is the function you will call for Method 1, 2, 3, 4
+    to get the comparison table for your report.
+    """
+    psnr_list = []
+    ssim_list = []
+
+    save_dir = Path(save_dir) if save_dir else None
+    if save_dir:
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+
+    for i, (lr, hr, name) in enumerate(dataloader):
+        # lr: (1, C, H, W), hr: (1, C, H*4, W*4)
+        with torch.no_grad():
+            sr = sr_function(lr)
+
+        # Convert to numpy for metrics
+        hr_np = tensor_to_numpy(hr[0])
+        sr_np = tensor_to_numpy(sr[0])
+        lr_np = tensor_to_numpy(lr[0])
+
+        # LR is small (1/4 size) - upsample it for visualization only
+        # using PIL, so all 3 images are same size in figure
+        lr_pil = Image.fromarray(lr_np).resize(
+            (hr_np.shape[1], hr_np.shape[0]), Image.BICUBIC
+        )
+        lr_np_big = np.array(lr_pil)
+
+        psnr = calculate_psnr(hr_np, sr_np)
+        ssim = calculate_ssim(hr_np, sr_np)
+
+        psnr_list.append(psnr)
+        ssim_list.append(ssim)
+
+        # Save first few examples for report
+        if save_dir and saved < max_save:
+            img_name = name[0] if isinstance(name, (list, tuple)) else str(name)
+            save_comparison(
+                lr_np_big, sr_np, hr_np,
+                save_dir / f"{img_name}_compare.png",
+                title=f"PSNR {psnr:.2f} | SSIM {ssim:.4f}"
+            )
+            saved += 1
+
+        print(f"[{i+1}/{len(dataloader)}] {name} - PSNR: {psnr:.2f} | SSIM: {ssim:.4f}")
+
+    results = {
+        "avg_psnr": float(np.mean(psnr_list)),
+        "avg_ssim": float(np.mean(ssim_list)),
+        "num_images": len(psnr_list),
+    }
+
+    print("\n===== FINAL RESULT =====")
+    print(f"Avg PSNR: {results['avg_psnr']:.2f} dB")
+    print(f"Avg SSIM: {results['avg_ssim']:.4f}")
+    print(f"Images: {results['num_images']}")
+
+    return results
+
+# --------------------------------------------------
+# Quick test - run: python -m src.utils
+# --------------------------------------------------
+if __name__ == "__main__":
+    set_seed(42)
+
+    # Test PSNR/SSIM on identical images -> should be inf / 1.0
+    dummy = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+    print("PSNR identical:", calculate_psnr(dummy, dummy))
+    print("SSIM identical:", calculate_ssim(dummy, dummy))
+
+    # Test PSNR/SSIM on different images
+    dummy2 = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+    print("PSNR different:", calculate_psnr(dummy, dummy2))
+    print("SSIM different:", calculate_ssim(dummy, dummy2))

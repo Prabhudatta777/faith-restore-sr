@@ -1,0 +1,21 @@
+# Data - never push images / zip to GitHub
+data/raw/
+data/processed/
+*.zip
+*.png
+*.jpg
+*.jpeg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Results
+results/
+checkpoints/
+runs/
+
+*.pth
