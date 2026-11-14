@@ -1,205 +1,852 @@
 """
-Method 5 - RCAN-Lite: ResNet + Channel Attention (EDSR / RCAN idea)
-Highest-PSNR method from curriculum.
+Method 5 - RCAN-Lite: ResNet + Channel Attention
+Faith Restore SR - Single Image Super Resolution (x4)
 
 Architecture:
-  Head: Conv 3 -> 64
-  Body: 5 Residual Groups, each with 5 Residual Blocks + Channel Attention
-  Tail: Conv 64 -> 3
-  Global Residual: Output = Bicubic Input + Network Output (learn residual only)
+    Head: Conv 3 -> 64
+    Body: 5 Residual Groups
+          Each group contains 5 Residual Blocks + Channel Attention
+    Tail: Conv 64 -> 3
+    Global Residual: Bicubic Input + Network Output
 
-Why this beats SRCNN:
-  - SRCNN: 3 layers, 57k params
-  - RCAN-Lite: 5*5=25 residual blocks, ~1.2M params, skip connections let it train deep
-  - Channel Attention: re-weights channels, edge channels get more weight
-  - Global Residual: network only learns detail to ADD to bicubic, easier to learn
+Features:
+    - Residual learning
+    - Channel Attention
+    - Global skip connections
+    - MPS acceleration for Apple Silicon
+    - Automatic best-checkpoint saving
+    - PSNR and SSIM evaluation
 
 Usage:
-  Train + Eval (30 epochs, quick test):
-    python -m src.method5_rcan --train --epochs 30 --eval
-  Train full (100 epochs, Colab GPU recommended):
-    python -m src.method5_rcan --train --epochs 100 --eval
-  Eval only (uses saved checkpoint):
-    python -m src.method5_rcan --eval
-  One-command runner will also pick it up if you add it to run_all.py
 
-Output (SAME as other methods):
-  results/method5_rcan/*_compare.png  (LR | SR | HR)
-  results/method5_rcan/results.txt     (Avg PSNR, Avg SSIM)
-  results/method5_rcan/rcan_best.pth   (best checkpoint by Val PSNR)
+    Train + Evaluate:
+        python -m src.method5_rcanlite --train --epochs 30 --eval
 
-Expected:
-  30 epochs, BSD100 70 train: ~27.0 dB, ~0.70 SSIM
-  100 epochs + more data: ~27.5-28.0 dB
-  World SOTA on BSD100 x4 is ~29 dB, PSNR 50 is impossible for x4 SR.
+    Train for 100 epochs:
+        python -m src.method5_rcanlite --train --epochs 100 --eval
+
+    Evaluate existing checkpoint:
+        python -m src.method5_rcanlite --eval
+
+    Custom batch size:
+        python -m src.method5_rcanlite --train --epochs 30 --batch-size 4 --eval
+
+Output:
+    results/method5_rcan/
+        rcan_best.pth
+        results.txt
+        *_compare.png
 """
+
 import argparse
 from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.dataset import BSD100SRDataset
-from src.utils import set_seed, evaluate_method, save_comparison
+from src.utils import set_seed, evaluate_method
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEVICE = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+
 RESULTS_DIR = Path("results/method5_rcan")
 CKPT = RESULTS_DIR / "rcan_best.pth"
 
-# ---------------- Model ----------------
+SCALE = 4
+PATCH_SIZE = 64
+BATCH_SIZE = 4
+LEARNING_RATE = 1e-4
+
+
+# ============================================================
+# CHANNEL ATTENTION
+# ============================================================
+
 class ChannelAttention(nn.Module):
-    """RCAN Channel Attention: learn which channels matter."""
-    def __init__(self, channels, reduction=16):
+
+    """
+    RCAN Channel Attention.
+
+    Learns the importance of individual feature channels.
+    """
+
+    def __init__(self, channels=64, reduction=16):
+
         super().__init__()
+
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
         self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+
+            nn.Conv2d(
+                channels,
+                channels // reduction,
+                kernel_size=1,
+                bias=False
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False),
-            nn.Sigmoid(),
+
+            nn.Conv2d(
+                channels // reduction,
+                channels,
+                kernel_size=1,
+                bias=False
+            ),
+
+            nn.Sigmoid()
         )
+
     def forward(self, x):
-        w = self.avg_pool(x)
-        w = self.fc(w)
-        return x * w
+
+        weights = self.avg_pool(x)
+
+        weights = self.fc(weights)
+
+        return x * weights
+
+
+# ============================================================
+# RESIDUAL BLOCK
+# ============================================================
 
 class ResidualBlock(nn.Module):
-    """EDSR-style Residual Block: Conv-ReLU-Conv + Channel Attention + Skip."""
+
+    """
+    EDSR-style residual block.
+
+    Conv -> ReLU -> Conv -> Channel Attention -> Skip
+    """
+
     def __init__(self, channels=64):
+
         super().__init__()
+
         self.body = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            )
         )
+
         self.ca = ChannelAttention(channels)
+
     def forward(self, x):
+
         out = self.body(x)
+
         out = self.ca(out)
-        return x + out  # skip connection - key to training deep nets
+
+        return x + out
+
+
+# ============================================================
+# RESIDUAL GROUP
+# ============================================================
 
 class ResidualGroup(nn.Module):
+
     def __init__(self, channels=64, n_blocks=5):
+
         super().__init__()
-        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(n_blocks)])
-        self.tail = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+
+        self.blocks = nn.Sequential(
+
+            *[
+                ResidualBlock(channels)
+                for _ in range(n_blocks)
+            ]
+
+        )
+
+        self.tail = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
     def forward(self, x):
+
         out = self.blocks(x)
+
         out = self.tail(out)
-        return x + out  # group-level skip
+
+        return x + out
+
+
+# ============================================================
+# RCAN-LITE NETWORK
+# ============================================================
 
 class RCANLite(nn.Module):
-    def __init__(self, channels=64, n_groups=5, n_blocks=5):
+
+    """
+    RCAN-Lite Super Resolution Network.
+
+    Input:
+        Bicubic-upsampled LR image [B, 3, H, W]
+
+    Output:
+        Super-resolved image [B, 3, H, W]
+    """
+
+    def __init__(
+        self,
+        channels=64,
+        n_groups=5,
+        n_blocks=5
+    ):
+
         super().__init__()
-        self.head = nn.Conv2d(3, channels, 3, padding=1, bias=False)
-        self.body = nn.Sequential(*[ResidualGroup(channels, n_blocks) for _ in range(n_groups)])
-        self.body_tail = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.tail = nn.Conv2d(channels, 3, 3, padding=1, bias=False)
+
+        # Initial feature extraction
+        self.head = nn.Conv2d(
+            3,
+            channels,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        # Residual groups
+        self.body = nn.Sequential(
+
+            *[
+                ResidualGroup(channels, n_blocks)
+                for _ in range(n_groups)
+            ]
+
+        )
+
+        # Long skip connection
+        self.body_tail = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        # Reconstruction
+        self.tail = nn.Conv2d(
+            channels,
+            3,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
     def forward(self, x):
-        # x = bicubic-upsampled LR, shape [B,3,H*4,W*4]
+
         base = x
+
         feat = self.head(x)
+
         out = self.body(feat)
+
         out = self.body_tail(out)
-        out = out + feat  # long skip: head -> tail
+
+        out = out + feat
+
         out = self.tail(out)
-        return base + out  # global residual: learn only detail to add to bicubic
 
-# ---------------- Training ----------------
-def train(epochs=30):
+        # Global residual learning
+        return base + out
+
+
+# ============================================================
+# SUPER RESOLUTION WRAPPER
+# ============================================================
+
+class RCANWrapper(nn.Module):
+
+    """
+    Adapts RCANLite to the shared evaluation interface.
+
+    evaluate_method supplies LR images.
+    RCANLite expects bicubic-upsampled LR images.
+
+    This wrapper performs the upsampling and device transfer.
+    """
+
+    def __init__(self, model, device):
+
+        super().__init__()
+
+        self.model = model
+
+        self.device = device
+
+    def forward(self, lr):
+
+        lr = lr.to(self.device)
+
+        lr_up = F.interpolate(
+
+            lr,
+
+            scale_factor=SCALE,
+
+            mode="bicubic",
+
+            align_corners=False
+
+        )
+
+        return self.model(lr_up)
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train(epochs=30, batch_size=BATCH_SIZE):
+
     set_seed(42)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Device: {DEVICE} | Training RCAN-Lite for {epochs} epochs")
-    train_ds = BSD100SRDataset(split="train", patch_size=64, augment=True, repeat=20)
-    val_ds = BSD100SRDataset(split="val", patch_size=64, augment=False, repeat=1)
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print("=" * 60)
+
+    print("METHOD 5: RCAN-LITE TRAINING")
+
+    print("=" * 60)
+
+    print(f"Device: {DEVICE}")
+
+    print(f"Epochs: {epochs}")
+
+    print(f"Batch size: {batch_size}")
+
+    print(f"Patch size: {PATCH_SIZE}")
+
+    # --------------------------------------------------------
+    # DATASETS
+    # --------------------------------------------------------
+
+    train_ds = BSD100SRDataset(
+
+        split="train",
+
+        patch_size=PATCH_SIZE,
+
+        augment=True
+
+    )
+
+    val_ds = BSD100SRDataset(
+
+        split="val",
+
+        patch_size=PATCH_SIZE,
+
+        augment=False
+
+    )
+
+    print(f"\nTraining images: {len(train_ds)}")
+
+    print(f"Validation images: {len(val_ds)}")
+
+    # --------------------------------------------------------
+    # DATALOADERS
+    # --------------------------------------------------------
+
+    train_loader = DataLoader(
+
+        train_ds,
+
+        batch_size=batch_size,
+
+        shuffle=True,
+
+        num_workers=0,
+
+        pin_memory=False
+
+    )
+
+    val_loader = DataLoader(
+
+        val_ds,
+
+        batch_size=1,
+
+        shuffle=False,
+
+        num_workers=0
+
+    )
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
 
     model = RCANLite().to(DEVICE)
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
-    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    # LR scheduler: halve LR every 20 epochs so it settles - fixes SRCNN plateau
-    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=20, gamma=0.5)
+
+    params = sum(
+
+        p.numel()
+        for p in model.parameters()
+
+    )
+
+    print(f"\nModel parameters: {params:,}")
+
+    # --------------------------------------------------------
+    # OPTIMIZER
+    # --------------------------------------------------------
+
+    optimizer = torch.optim.Adam(
+
+        model.parameters(),
+
+        lr=LEARNING_RATE
+
+    )
+
+    scheduler = torch.optim.lr_scheduler.StepLR(
+
+        optimizer,
+
+        step_size=20,
+
+        gamma=0.5
+
+    )
+
     loss_fn = nn.MSELoss()
-    best_psnr = 0.0
-    if CKPT.exists():
-        try:
-            ck = torch.load(CKPT, map_location=DEVICE)
-            best_psnr = ck.get("best_psnr", 0.0)
-            print(f"Existing best checkpoint Val PSNR: {best_psnr:.2f} dB (will overwrite only if better)")
-        except Exception:
-            pass
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
-        for lr, hr in pbar:
-            lr, hr = lr.to(DEVICE), hr.to(DEVICE)
-            # Upsample LR x4 with bicubic first, same as SRCNN input
-            lr_up = F.interpolate(lr, scale_factor=4, mode="bicubic", align_corners=False)
-            sr = model(lr_up)
-            loss = loss_fn(sr, hr)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.5f}")
-        sched.step()
-        # Val PSNR
-        model.eval()
-        val_psnr, _ = evaluate_method(model, val_loader, DEVICE, save_dir=None, method_name="val")
-        print(f"Epoch {epoch}: Train Loss {total/len(train_loader):.5f} | Val PSNR {val_psnr:.2f} dB | LR {sched.get_last_lr()[0]:.2e}")
-        if val_psnr > best_psnr:
-            best_psnr = val_psnr
-            torch.save({"model": model.state_dict(), "best_psnr": best_psnr, "epoch": epoch}, CKPT)
-            print(f"  -> New best! Saved to {CKPT}")
-    print(f"Training done. Best Val PSNR: {best_psnr:.2f} dB")
 
-# ---------------- Eval ----------------
+    # Start a fresh training run.
+    # Do not compare a randomly initialized model against
+    # an old checkpoint's validation score.
+
+    best_psnr = float("-inf")
+
+    # Wrapper used during validation
+    val_model = RCANWrapper(model, DEVICE)
+
+    # --------------------------------------------------------
+    # TRAINING LOOP
+    # --------------------------------------------------------
+
+    for epoch in range(1, epochs + 1):
+
+        model.train()
+
+        total_loss = 0.0
+
+        pbar = tqdm(
+
+            train_loader,
+
+            desc=f"Epoch {epoch}/{epochs}",
+
+            leave=True
+
+        )
+
+        for lr, hr, _ in pbar:
+
+            lr = lr.to(DEVICE)
+
+            hr = hr.to(DEVICE)
+
+            # Bicubic upsampling x4
+            lr_up = F.interpolate(
+
+                lr,
+
+                scale_factor=SCALE,
+
+                mode="bicubic",
+
+                align_corners=False
+
+            )
+
+            # Forward pass
+            sr = model(lr_up)
+
+            # Reconstruction loss
+            loss = loss_fn(sr, hr)
+
+            # Backpropagation
+            optimizer.zero_grad(set_to_none=True)
+
+            loss.backward()
+
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            pbar.set_postfix(
+
+                loss=f"{loss.item():.5f}"
+
+            )
+
+        # Learning rate scheduling
+        scheduler.step()
+
+        avg_loss = total_loss / len(train_loader)
+
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
+
+        model.eval()
+
+        metrics = evaluate_method(
+
+            val_model,
+
+            val_loader,
+
+            save_dir=None
+
+        )
+
+        val_psnr = metrics["avg_psnr"]
+
+        val_ssim = metrics["avg_ssim"]
+
+        current_lr = scheduler.get_last_lr()[0]
+
+        print("\n" + "-" * 55)
+
+        print(f"Epoch: {epoch}/{epochs}")
+
+        print(f"Train Loss: {avg_loss:.6f}")
+
+        print(f"Val PSNR: {val_psnr:.2f} dB")
+
+        print(f"Val SSIM: {val_ssim:.4f}")
+
+        print(f"Learning Rate: {current_lr:.2e}")
+
+        print("-" * 55)
+
+        # ----------------------------------------------------
+        # SAVE BEST CHECKPOINT
+        # ----------------------------------------------------
+
+        if val_psnr > best_psnr:
+
+            best_psnr = val_psnr
+
+            torch.save(
+
+                {
+
+                    "model": model.state_dict(),
+
+                    "best_psnr": best_psnr,
+
+                    "best_ssim": val_ssim,
+
+                    "epoch": epoch
+
+                },
+
+                CKPT
+
+            )
+
+            print(f"New best checkpoint saved: {CKPT}")
+
+    print("\n" + "=" * 60)
+
+    print("TRAINING COMPLETED")
+
+    print(f"Best Validation PSNR: {best_psnr:.2f} dB")
+
+    print(f"Checkpoint: {CKPT}")
+
+    print("=" * 60)
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
 @torch.no_grad()
+
 def evaluate():
+
     set_seed(42)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    RESULTS_DIR.mkdir(
+
+        parents=True,
+
+        exist_ok=True
+
+    )
+
+    print("=" * 60)
+
+    print("METHOD 5: RCAN-LITE EVALUATION")
+
+    print("=" * 60)
+
     if not CKPT.exists():
-        print(f"No checkpoint found at {CKPT}. Train first: python -m src.method5_rcan --train --epochs 30 --eval")
+
+        print("\nNo checkpoint found!")
+
+        print("Train the model first.")
+
         return
+
+    # --------------------------------------------------------
+    # LOAD MODEL
+    # --------------------------------------------------------
+
     model = RCANLite().to(DEVICE)
-    ck = torch.load(CKPT, map_location=DEVICE)
+
+    ck = torch.load(
+
+        CKPT,
+
+        map_location=DEVICE
+
+    )
+
     model.load_state_dict(ck["model"])
+
     model.eval()
-    print(f"Loaded checkpoint epoch {ck.get('epoch')} Val PSNR {ck.get('best_psnr', 0):.2f} dB")
-    test_ds = BSD100SRDataset(split="test", patch_size=100000, augment=False, repeat=1)
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
-    # evaluate_method expects model that takes LR and returns SR.
-    # Our model takes bicubic-upsampled LR, so wrap it:
-    class Wrapper(nn.Module):
-        def __init__(self, m):
-            super().__init__()
-            self.m = m
-        def forward(self, lr):
-            lr_up = F.interpolate(lr, scale_factor=4, mode="bicubic", align_corners=False)
-            return self.m(lr_up)
-    wrapped = Wrapper(model).to(DEVICE)
-    avg_psnr, avg_ssim = evaluate_method(wrapped, test_loader, DEVICE, save_dir=str(RESULTS_DIR), method_name="method5_rcan")
-    # Save results.txt SAME format as other methods
-    with open(RESULTS_DIR / "results.txt", "w") as f:
-        f.write(f"Method 5: RCAN-Lite (ResNet + Channel Attention)\n")
-        f.write(f"Avg PSNR: {avg_psnr:.2f} dB\n")
-        f.write(f"Avg SSIM: {avg_ssim:.4f}\n")
-    print(f"\nMethod 5 RCAN-Lite - Avg PSNR: {avg_psnr:.2f} dB | Avg SSIM: {avg_ssim:.4f}")
-    print(f"Saved: {RESULTS_DIR}/results.txt and {RESULTS_DIR}/*_compare.png")
+
+    print(f"\nLoaded checkpoint: {CKPT}")
+
+    print(f"Best epoch: {ck.get('epoch')}")
+
+    print(
+
+        f"Best validation PSNR: "
+        f"{ck.get('best_psnr', 0):.2f} dB"
+
+    )
+
+    # --------------------------------------------------------
+    # TEST DATASET
+    # --------------------------------------------------------
+
+    test_ds = BSD100SRDataset(
+
+        split="test",
+
+        patch_size=PATCH_SIZE,
+
+        augment=False
+
+    )
+
+    test_loader = DataLoader(
+
+        test_ds,
+
+        batch_size=1,
+
+        shuffle=False,
+
+        num_workers=0
+
+    )
+
+    print(f"\nTest images: {len(test_ds)}")
+
+    # --------------------------------------------------------
+    # EVALUATION
+    # --------------------------------------------------------
+
+    wrapped_model = RCANWrapper(
+
+        model,
+
+        DEVICE
+
+    )
+
+    metrics = evaluate_method(
+
+        wrapped_model,
+
+        test_loader,
+
+        save_dir=str(RESULTS_DIR),
+
+        max_save=10
+
+    )
+
+    avg_psnr = metrics["avg_psnr"]
+
+    avg_ssim = metrics["avg_ssim"]
+
+    # --------------------------------------------------------
+    # SAVE RESULTS
+    # --------------------------------------------------------
+
+    with open(
+
+        RESULTS_DIR / "results.txt",
+
+        "w"
+
+    ) as f:
+
+        f.write(
+
+            "Method 5: RCAN-Lite "
+            "(ResNet + Channel Attention)\n"
+
+        )
+
+        f.write(
+
+            f"Avg PSNR: {avg_psnr:.2f} dB\n"
+
+        )
+
+        f.write(
+
+            f"Avg SSIM: {avg_ssim:.4f}\n"
+
+        )
+
+        f.write(
+
+            f"Images: {metrics['num_images']}\n"
+
+        )
+
+        f.write(
+
+            f"Checkpoint Epoch: {ck.get('epoch')}\n"
+
+        )
+
+    print("\n" + "=" * 60)
+
+    print("FINAL RCAN-LITE RESULTS")
+
+    print("=" * 60)
+
+    print(f"Average PSNR: {avg_psnr:.2f} dB")
+
+    print(f"Average SSIM: {avg_ssim:.4f}")
+
+    print(f"Images evaluated: {metrics['num_images']}")
+
+    print(f"\nResults saved in: {RESULTS_DIR}")
+
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train", action="store_true")
-    ap.add_argument("--eval", action="store_true")
-    ap.add_argument("--epochs", type=int, default=30)
-    args = ap.parse_args()
+
+    parser = argparse.ArgumentParser(
+
+        description="Faith Restore SR - RCAN-Lite"
+
+    )
+
+    parser.add_argument(
+
+        "--train",
+
+        action="store_true",
+
+        help="Train RCAN-Lite"
+
+    )
+
+    parser.add_argument(
+
+        "--eval",
+
+        action="store_true",
+
+        help="Evaluate RCAN-Lite"
+
+    )
+
+    parser.add_argument(
+
+        "--epochs",
+
+        type=int,
+
+        default=30,
+
+        help="Number of training epochs"
+
+    )
+
+    parser.add_argument(
+
+        "--batch-size",
+
+        type=int,
+
+        default=BATCH_SIZE,
+
+        help="Training batch size"
+
+    )
+
+    args = parser.parse_args()
+
     if args.train:
-        train(epochs=args.epochs)
+
+        train(
+
+            epochs=args.epochs,
+
+            batch_size=args.batch_size
+
+        )
+
     if args.eval:
+
         evaluate()
+
     if not args.train and not args.eval:
-        print("Use: python -m src.method5_rcan --train --epochs 30 --eval  OR  python -m src.method5_rcan --eval")
+
+        parser.print_help()
