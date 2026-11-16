@@ -294,10 +294,10 @@ Fill this after running `final_comparison.py`. Example format:
 | Method | Avg PSNR (dB) | Avg SSIM |
 |---|---|---|
 | 1. Bicubic | 26.25 | 0.6509 |
-| 2. Edge + Seg | — (fill from results.txt) | — |
-| 3. Dictionary | 13.83 | 0.2755 |
-| 4. CNN (SRCNN, 5 epochs) | 25.33 | 0.6182 |
-| 5. RCAN-Lite (30 epochs) | ~27.0 (expected) | ~0.70 (expected) |
+| 2. Edge + Seg | 26.17 | 0.6297 |
+| 3. Dictionary | 13.79 | 0.2730 |
+| 4. SRCNN (30 epochs) | 25.35 | 0.6182 |
+| 5. RCAN-Lite (30 epochs) | 25.68 | 0.6315 |
 
 > Expected story: Bicubic is a strong baseline. Edge+Seg improves sharpness slightly.
 > Dictionary fails because K-Means averaging blurs details. SRCNN with limited training
